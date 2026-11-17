@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Gold — Abandoned cart alerts (flatMapGroupsWithState)
+# MAGIC # Gold — Abandoned cart alerts (applyInPandasWithState)
 # MAGIC Klucz: session_id. Timeout: 15 min processing time.
 
 # COMMAND ----------
@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Iterator, List
 
-from pyspark.sql import SparkSession, Row
+import pandas as pd
+
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
 from pyspark.sql.types import (
@@ -19,6 +22,12 @@ from pyspark.sql.types import (
     DoubleType, TimestampType,
 )
 from delta.tables import DeltaTable
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+logger = logging.getLogger("nexashop.gold.abandoned_cart")
 
 spark = SparkSession.builder.getOrCreate()
 
@@ -62,83 +71,100 @@ STATE_SCHEMA = StructType([
 ])
 
 
+EMPTY_OUTPUT = pd.DataFrame({
+    "session_id":    pd.Series(dtype="object"),
+    "customer_id":   pd.Series(dtype="object"),
+    "cart_items":    pd.Series(dtype="object"),
+    "items_count":   pd.Series(dtype="Int32"),
+    "total_value":   pd.Series(dtype="float64"),
+    "last_activity": pd.Series(dtype="datetime64[ns]"),
+    "alert_at":      pd.Series(dtype="datetime64[ns]"),
+})
+
+
 # COMMAND ----------
 
-def _cart_state_fn(key, pdf_iter, state: GroupState) -> Iterator[Row]:
-    """flatMapGroupsWithState handler.
+def _cart_state_fn(
+    key, pdf_iter, state: GroupState
+) -> Iterator[pd.DataFrame]:
+    """applyInPandasWithState handler.
 
-    Agreguje dodania/usunięcia do koszyka; emituje alert gdy timeout.
+    Agreguje dodania/usunięcia do koszyka; na timeout emituje alert
+    porzuconego koszyka i czyści stan.
     """
     session_id = key[0]
 
-    if state.hasTimedOut:
+    try:
+        if state.hasTimedOut:
+            if state.exists:
+                customer_id, items_json, items_count, total_value, last_activity = state.get
+                state.remove()
+                if items_count and items_count > 0:
+                    logger.info(
+                        "abandoned_cart alert session=%s items=%d value=%.2f",
+                        session_id, items_count, total_value,
+                    )
+                    yield pd.DataFrame([{
+                        "session_id":    session_id,
+                        "customer_id":   customer_id,
+                        "cart_items":    items_json,
+                        "items_count":   int(items_count),
+                        "total_value":   float(total_value),
+                        "last_activity": last_activity,
+                        "alert_at":      datetime.now(timezone.utc),
+                    }])
+                    return
+            return
+
         if state.exists:
-            s = state.get
-            customer_id, items_json, items_count, total_value, last_activity = s
-            state.remove()
-            if items_count > 0:
-                yield Row(
-                    session_id=session_id,
-                    customer_id=customer_id,
-                    cart_items=items_json,
-                    items_count=int(items_count),
-                    total_value=float(total_value),
-                    last_activity=last_activity,
-                    alert_at=datetime.now(timezone.utc),
-                )
-        return
+            customer_id, items_json, items_count, total_value, last_activity = state.get
+            items: List[dict] = json.loads(items_json) if items_json else []
+        else:
+            customer_id   = None
+            items         = []
+            items_count   = 0
+            total_value   = 0.0
+            last_activity = None
 
-    if state.exists:
-        customer_id, items_json, items_count, total_value, last_activity = state.get
-        items: List[dict] = json.loads(items_json) if items_json else []
-    else:
-        customer_id   = None
-        items         = []
-        items_count   = 0
-        total_value   = 0.0
-        last_activity = None
+        rows = [pdf for pdf in pdf_iter]
+        if rows:
+            df = pd.concat(rows, ignore_index=True).sort_values("event_timestamp")
+            for _, r in df.iterrows():
+                customer_id   = r["customer_id"] or customer_id
+                last_activity = r["event_timestamp"]
+                action        = r["action"]
+                product_id    = r["product_id"]
+                value         = float(r["unit_price"] or 0.0)
+                if action == "ADD_TO_CART" and product_id:
+                    items.append({"product_id": product_id, "price": value})
+                    items_count += 1
+                    total_value += value
+                elif action == "REMOVE_FROM_CART" and product_id:
+                    for i, it in enumerate(items):
+                        if it["product_id"] == product_id:
+                            items.pop(i)
+                            items_count = max(0, items_count - 1)
+                            total_value = max(0.0, total_value - value)
+                            break
+                elif action == "PURCHASE":
+                    items = []
+                    items_count = 0
+                    total_value = 0.0
 
-    import pandas as pd  # noqa: F401
-    rows = []
-    for pdf in pdf_iter:
-        rows.append(pdf)
+        state.update((
+            customer_id,
+            json.dumps(items),
+            int(items_count),
+            float(total_value),
+            last_activity,
+        ))
+        state.setTimeoutDuration(TIMEOUT_MS)
 
-    if rows:
-        import pandas as pd
-        df = pd.concat(rows, ignore_index=True)
-        df = df.sort_values("event_timestamp")
-        for _, r in df.iterrows():
-            customer_id   = r["customer_id"] or customer_id
-            last_activity = r["event_timestamp"]
-            action        = r["action"]
-            product_id    = r["product_id"]
-            value         = float(r["unit_price"] or 0.0)
-            if action == "ADD_TO_CART" and product_id:
-                items.append({"product_id": product_id, "price": value})
-                items_count += 1
-                total_value += value
-            elif action == "REMOVE_FROM_CART" and product_id:
-                for i, it in enumerate(items):
-                    if it["product_id"] == product_id:
-                        items.pop(i)
-                        items_count = max(0, items_count - 1)
-                        total_value = max(0.0, total_value - value)
-                        break
-            elif action == "PURCHASE":
-                items = []
-                items_count = 0
-                total_value = 0.0
+    except Exception:
+        logger.exception("cart_state_fn failed for session_id=%s", session_id)
+        raise
 
-    state.update((
-        customer_id,
-        json.dumps(items),
-        int(items_count),
-        float(total_value),
-        last_activity,
-    ))
-    state.setTimeoutDuration(TIMEOUT_MS)
-
-    return iter([])
+    yield EMPTY_OUTPUT
 
 
 # COMMAND ----------
@@ -163,16 +189,21 @@ alerts = (
 
 
 def _merge_alerts(batch_df, batch_id: int) -> None:
-    if batch_df.rdd.isEmpty():
-        return
-    tgt = DeltaTable.forName(spark, TABLE)
-    (
-        tgt.alias("t")
-        .merge(batch_df.alias("s"), "t.session_id = s.session_id")
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
-        .execute()
-    )
+    try:
+        if batch_df.rdd.isEmpty():
+            return
+        tgt = DeltaTable.forName(spark, TABLE)
+        (
+            tgt.alias("t")
+            .merge(batch_df.alias("s"), "t.session_id = s.session_id")
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        logger.info("merged batch_id=%d into %s", batch_id, TABLE)
+    except Exception:
+        logger.exception("merge failed for batch_id=%d", batch_id)
+        raise
 
 
 query = (
@@ -185,4 +216,5 @@ query = (
         .start()
 )
 
+logger.info("gold_abandoned_cart_alerts started; checkpoint=%s", CHECKPOINT)
 query.awaitTermination()

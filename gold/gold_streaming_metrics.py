@@ -5,10 +5,17 @@
 
 # COMMAND ----------
 
+import logging
 from datetime import datetime, timezone
 
 from pyspark.sql import SparkSession, Row
 from pyspark.sql.streaming import StreamingQueryListener
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+logger = logging.getLogger("nexashop.gold.metrics")
 
 spark = SparkSession.builder.getOrCreate()
 
@@ -46,8 +53,11 @@ class MetricsListener(StreamingQueryListener):
         )
         try:
             spark.createDataFrame([row]).write.format("delta").mode("append").saveAsTable(TABLE)
-        except Exception as e:                    # noqa: BLE001
-            print(f"[MetricsListener] write failed: {e}")
+        except Exception:                         # noqa: BLE001
+            logger.exception(
+                "metrics write failed for query=%s batch_id=%s",
+                row.query_name, row.batch_id,
+            )
 
     def onQueryTerminated(self, event):
         pass
@@ -57,7 +67,7 @@ class MetricsListener(StreamingQueryListener):
 
 listener = MetricsListener()
 spark.streams.addListener(listener)
-print("StreamingQueryListener registered. Keep this notebook attached while queries run.")
+logger.info("StreamingQueryListener registered. Keep this notebook attached while queries run.")
 
 # COMMAND ----------
 
